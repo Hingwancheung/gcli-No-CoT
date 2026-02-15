@@ -2,7 +2,7 @@
 Gemini Router - Handles native Gemini format API requests
 处理原生Gemini格式请求的路由模块
 """
-
+import re
 import sys
 from pathlib import Path
 
@@ -332,7 +332,7 @@ async def stream_generate_content(
                 # 其他类型，直接返回
                 yield chunk
 
-    # ========== 普通流式生成器 ==========
+# ========== 普通流式生成器 (修改版：增加思考鏈過濾) ==========
     async def normal_stream_generator():
         from src.converter.gemini_fix import normalize_gemini_request
         from src.api.geminicli import stream_request
@@ -340,58 +340,78 @@ async def stream_generate_content(
 
         normalized_req = await normalize_gemini_request(normalized_dict.copy(), mode="geminicli")
 
-        # 准备API请求格式 - 提取model并将其他字段放入request中
+        # 准备API请求格式
         api_request = {
             "model": normalized_req.pop("model"),
             "request": normalized_req
         }
 
-        # 所有流式请求都使用非 native 模式（SSE格式）并展开 response 包装
-        log.debug(f"[GEMINICLI] 使用非native模式，将展开response包装")
+        log.debug(f"[GEMINICLI] 使用非native模式，將展開response包裝 (並過濾思考鏈)")
         stream_gen = stream_request(body=api_request, native=False)
+
+        # 定义过虑正则 
+        def clean_text(text):
+            if not text: return ""
+            # 去除 <think> 标签
+            text = re.sub(r'<think>[\s\S]*?</think>', '', text)
+            # 去除 Gemini 的碎碎念
+            text = re.sub(r"(?i)^(okay|alright),?\s+here'?s\s+what\s+i'?m\s+thinking.*?\n", "", text)
+            # 去除 Analysis/Reasoning 开头
+            text = re.sub(r"(?i)^(analysis|reasoning|thought process):[\s\S]*?\n\n", "", text)
+            return text
 
         # 展开 response 包装
         async for chunk in stream_gen:
-            # 检查是否是Response对象（错误情况）
+            # ... (错误处理部分保持不变) ...
             if isinstance(chunk, Response):
-                # 将Response转换为SSE格式的错误消息
                 error_content = chunk.body if isinstance(chunk.body, bytes) else chunk.body.encode('utf-8')
                 error_json = json.loads(error_content.decode('utf-8'))
-                # 以SSE格式返回错误
                 yield f"data: {json.dumps(error_json)}\n\n".encode('utf-8')
                 return
 
-            # 处理SSE格式的chunk
+            # 处理 SSE 格式的 chunk
             if isinstance(chunk, (str, bytes)):
                 chunk_str = chunk.decode('utf-8') if isinstance(chunk, bytes) else chunk
 
-                # 解析并展开 response 包装
                 if chunk_str.startswith("data: "):
                     json_str = chunk_str[6:].strip()
 
-                    # 跳过 [DONE] 标记
                     if json_str == "[DONE]":
                         yield chunk
                         continue
 
                     try:
-                        # 解析JSON
                         data = json.loads(json_str)
+                        target_data = None
 
-                        # 展开 response 包装
+                        # 1. 提取出要处理的数据对象 (target_data)
                         if "response" in data and "candidates" not in data:
-                            log.debug(f"[GEMINICLI] 展开response包装")
-                            unwrapped_data = data["response"]
-                            # 重新构建SSE格式
-                            yield f"data: {json.dumps(unwrapped_data, ensure_ascii=False)}\n\n".encode('utf-8')
+                            target_data = data["response"] # 需要展开
                         else:
-                            # 已经是展开的格式，直接返回
-                            yield chunk
+                            target_data = data # 已经是展开的
+
+                    
+                        # 检查是否有 candidates 和 parts，如果有，清洗 text
+                        if "candidates" in target_data:
+                            for cand in target_data["candidates"]:
+                                if "content" in cand and "parts" in cand["content"]:
+                                    new_parts = []
+                                    for part in cand["content"]["parts"]:
+                                        if "text" in part:
+                                            # 清洗文本
+                                            cleaned_text = clean_text(part["text"])
+                                            # 只有清洗后还有内容才保留 (或者保留空串防止结构断裂，视情况而定)
+                                            # 直接替换文本
+                                            part["text"] = cleaned_text
+                                        new_parts.append(part)
+                                    cand["content"]["parts"] = new_parts
+
+                        # 重新打包回 JSON
+                        yield f"data: {json.dumps(target_data, ensure_ascii=False)}\n\n".encode('utf-8')
+
                     except json.JSONDecodeError:
-                        # JSON解析失败，直接返回原始chunk
                         yield chunk
                 else:
-                    # 不是SSE格式，直接返回
                     yield chunk
 
     # ========== 根据模式选择生成器 ==========
