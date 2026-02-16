@@ -2,7 +2,7 @@
 Main Web Integration - Integrates all routers and modules
 集合router并开启主服务
 """
-
+import os
 import asyncio
 from contextlib import asynccontextmanager
 
@@ -177,5 +177,30 @@ async def main():
     await serve(app, config)
 
 
+# 把這一段貼在 web.py 的最下面
 if __name__ == "__main__":
-    asyncio.run(main())
+    import os
+    import asyncio
+    from hypercorn.asyncio import serve
+    from hypercorn.config import Config
+    
+    # 直接從環境變量讀取端口，不依賴緩慢的 config.py
+    # 如果 Docker 說 8080，這裡就立刻拿到 8080
+    port = int(os.getenv("PORT", "8080"))
+    host = os.getenv("HOST", "0.0.0.0")
+    
+    # 打印日誌讓我們知道它活著
+    print("=" * 60)
+    print(f"🚀 GCLI2API 正在啟動，強制監聽: http://{host}:{port}")
+    print("=" * 60)
+    
+    # 配置 Hypercorn 服務器
+    config = Config()
+    config.bind = [f"{host}:{port}"]
+    config.accesslog = "-"
+    config.errorlog = "-"
+    config.loglevel = "INFO"
+    config.keep_alive_timeout = 120
+    
+    
+    asyncio.run(serve(app, config))
